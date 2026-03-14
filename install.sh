@@ -1,38 +1,40 @@
 #!/bin/bash
 
-# CYBERVIS v5.0 — Installer
-# Repository details
-REPO_URL="https://github.com/logandaddy12-dot/cybervis.git"
-TEMP_DIR="cybervis_build"
+# CYBERVIS v5.0 — Direct Installer
+# Raw URLs for your files
+BASE_URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main"
 
 echo "─── CYBERVIS INSTALLER ───"
 
-# 1. Clean up any previous failed attempts
-rm -rf "$TEMP_DIR"
+# 1. Create a temporary build directory
+mkdir -p cybervis_build
+cd cybervis_build
 
-# 2. Clone the repo to get the Makefile and source
-echo "Cloning repository..."
-git clone --depth 1 "$REPO_URL" "$TEMP_DIR"
+# 2. Download the required files
+echo "Fetching source files..."
+curl -sL "$BASE_URL/cybervis.c" -o cybervis.c
+curl -sL "$BASE_URL/Makefile" -o Makefile
 
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to clone repository."
+# 3. Verify files exist
+if [ ! -f "cybervis.c" ] || [ ! -f "Makefile" ]; then
+    echo "Error: Could not download source files from GitHub."
     exit 1
 fi
 
-# 3. Enter directory and run the Makefile
-cd "$TEMP_DIR"
+# 4. Run your Makefile
+echo "Compiling..."
+make
 
-echo "Compiling and installing..."
-# This runs the 'install' target in your Makefile
-sudo make install
-
-# 4. Success check and cleanup
-if [ $? -eq 0 ]; then
-    echo "─── INSTALLATION COMPLETE ───"
-    echo "Run it now by typing: cybervis"
+# 5. Install using your Makefile's install target
+if [ -f "cybervis" ]; then
+    echo "Installing..."
+    sudo make install
+    
+    # Cleanup
     cd ..
-    rm -rf "$TEMP_DIR"
+    rm -rf cybervis_build
+    echo "─── DONE! Type 'cybervis' to start ───"
 else
-    echo "Error: Build or installation failed."
+    echo "Compilation failed. Check if 'build-essential' is installed."
     exit 1
 fi
