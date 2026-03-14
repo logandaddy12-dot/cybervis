@@ -2,7 +2,7 @@
 
 # CYBERVIS v5.0 — Direct Stream Installer
 # This URL must be the RAW source code link
-SRC="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
+SRC="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis"
 
 echo "─── CYBERVIS INSTALLER ───"
 
