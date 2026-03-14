@@ -20,8 +20,8 @@ if ! git clone --depth 1 "$REPO_URL" . ; then
 fi
 
 # 3. Verify files are actually here
-if [ ! -f "cybervis.c" ]; then
-    echo "Error: cybervis.c not found in repository!"
+if [ ! -f "cybervis" ]; then
+    echo "Error: cybervis not found in repository!"
     exit 1
 fi
 
