@@ -1,33 +1,32 @@
 #!/bin/bash
 
-# Configuration
-SOURCE_URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
-OUT_FILE="cybervis"
+# CYBERVIS v5.0 — Direct Installer
+# URL for the source code
+SRC="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
 
-echo "--- Installing Cybervis ---"
+echo "─── CYBERVIS INSTALLER ───"
 
-# 1. Download the C file
-echo "Downloading source..."
-curl -sL "$SOURCE_URL" -o cybervis.c
+# 1. Download the source directly into the current path
+echo "Fetching: cybervis.c"
+curl -sL "$SRC" -o cybervis.c
 
-# 2. Check if download actually worked
-if [ ! -f "cybervis.c" ]; then
-    echo "Error: Could not download cybervis.c. Check your internet or URL."
+# 2. Compile immediately
+echo "Building binary..."
+gcc -O3 cybervis.c -o cybervis -lm -lpthread
+
+# 3. Check if build worked and move to system path
+if [ -f "cybervis" ]; then
+    echo "Installing to /usr/local/bin..."
+    sudo mv cybervis /usr/local/bin/
+    sudo chmod +x /usr/local/bin/cybervis
+    
+    # Cleanup source file
+    rm cybervis.c
+    
+    echo "Done! Type 'cybervis' to launch."
+else
+    echo "Error: Compilation failed. Make sure 'gcc' is installed."
+    # Clean up anyway to keep dir tidy
+    [ -f "cybervis.c" ] && rm cybervis.c
     exit 1
 fi
-
-# 3. Compile the file
-echo "Compiling..."
-gcc cybervis.c -o "$OUT_FILE"
-
-# 4. Move to bin so you can run 'cybervis' anywhere
-if [ -f "$OUT_FILE" ]; then
-    sudo mv "$OUT_FILE" /usr/local/bin/
-    chmod +x /usr/local/bin/cybervis
-    echo "Success! You can now run the app by typing: cybervis"
-else
-    echo "Compilation failed. Do you have gcc installed?"
-fi
-
-# 5. Clean up the source file
-rm cybervis.c
