@@ -1,52 +1,33 @@
 #!/bin/bash
 
-# CYBERVIS v5.0 — Remote Installer
-# This script downloads the source from GitHub and installs the binary.
+# Configuration
+SOURCE_URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
+OUT_FILE="cybervis"
 
-REPO_URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
-BINARY_NAME="cybervis"
-INSTALL_PATH="/usr/local/bin/$BINARY_NAME"
+echo "--- Installing Cybervis ---"
 
-echo "─── CYBERVIS v5.0 REMOTE INSTALLER ───"
+# 1. Download the C file
+echo "Downloading source..."
+curl -sL "$SOURCE_URL" -o cybervis.c
 
-# 1. Check for compiler
-if ! command -v gcc &> /dev/null; then
-    echo "Error: gcc is not installed. Run 'sudo apt install build-essential' first."
-    exit 1
-fi
-
-# 2. Download the source file
-echo "Fetching source from GitHub..."
-curl -s -O "$REPO_URL"
-
+# 2. Check if download actually worked
 if [ ! -f "cybervis.c" ]; then
-    echo "Error: Failed to download cybervis.c from $REPO_URL"
+    echo "Error: Could not download cybervis.c. Check your internet or URL."
     exit 1
 fi
 
-# 3. Compile
-echo "Compiling CYBERVIS..."
-gcc -O3 -o "$BINARY_NAME" cybervis.c -lm -lpthread
+# 3. Compile the file
+echo "Compiling..."
+gcc cybervis.c -o "$OUT_FILE"
 
-if [ $? -eq 0 ]; then
-    echo "Build successful."
+# 4. Move to bin so you can run 'cybervis' anywhere
+if [ -f "$OUT_FILE" ]; then
+    sudo mv "$OUT_FILE" /usr/local/bin/
+    chmod +x /usr/local/bin/cybervis
+    echo "Success! You can now run the app by typing: cybervis"
 else
-    echo "Compilation failed."
-    exit 1
+    echo "Compilation failed. Do you have gcc installed?"
 fi
 
-# 4. Install to system path
-echo "Installing to $INSTALL_PATH (requires sudo)..."
-sudo mv "$BINARY_NAME" "$INSTALL_PATH"
-sudo chmod +x "$INSTALL_PATH"
-
-# 5. Cleanup
+# 5. Clean up the source file
 rm cybervis.c
-
-if [ $? -eq 0 ]; then
-    echo "─── INSTALLATION COMPLETE ───"
-    echo "Run it now by typing: cybervis"
-else
-    echo "Installation failed during move."
-    exit 1
-fi
