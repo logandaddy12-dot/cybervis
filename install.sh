@@ -1,37 +1,41 @@
 #!/bin/bash
 
-# CYBERVIS v5.0 — Direct Path Installer
-# Ensure this URL is the RAW link to your code
-RAW_SRC="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
+# CYBERVIS v5.0 — Absolute Fix Installer
+REPO_URL="https://github.com/logandaddy12-dot/cybervis.git"
+BUILD_DIR="/tmp/cybervis_build"
 
-echo "─── CYBERVIS INSTALLER ───"
+echo "─── CYBERVIS SYSTEM INSTALL ───"
 
-# 1. Jump to /tmp to ensure we have write permissions
-cd /tmp
+# 1. Clean up and setup workspace
+sudo rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR" || exit
 
-# 2. Download the source code
-echo "Downloading source..."
-curl -sL "$RAW_SRC" -o cybervis.c
-
-# 3. Check if the file actually exists now
-if [ ! -f "cybervis.c" ]; then
-    echo "Fatal Error: cybervis.c could not be downloaded."
-    echo "Check your URL: $RAW_SRC"
+# 2. Use Git to pull the full project
+echo "Cloning repository..."
+if ! git clone --depth 1 "$REPO_URL" . ; then
+    echo "Error: Git clone failed. Is 'git' installed?"
+    echo "Try: sudo apt install git -y"
     exit 1
 fi
 
-# 4. Compile (using your Makefile flags)
-echo "Compiling..."
-gcc -O3 cybervis.c -o cybervis -lm -lpthread
+# 3. Verify files are actually here
+if [ ! -f "cybervis.c" ]; then
+    echo "Error: cybervis.c not found in repository!"
+    exit 1
+fi
 
-# 5. Move to local bin
-if [ -f "cybervis" ]; then
-    echo "Installing to /usr/local/bin..."
-    sudo mv cybervis /usr/local/bin/cybervis
-    sudo chmod +x /usr/local/bin/cybervis
-    rm cybervis.c
-    echo "─── SUCCESS: Type 'cybervis' to launch ───"
+# 4. Use your Makefile
+echo "Building and Installing..."
+sudo make install
+
+# 5. Final Cleanup
+if [ $? -eq 0 ]; then
+    echo "─── INSTALLATION SUCCESSFUL ───"
+    echo "Type 'cybervis' to launch."
+    cd /tmp
+    sudo rm -rf "$BUILD_DIR"
 else
-    echo "Error: Compilation failed. Is 'gcc' installed?"
+    echo "Error: 'make install' failed."
     exit 1
 fi
