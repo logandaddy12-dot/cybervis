@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+wake — Wake-on-LAN Terminal App
+Usage: wake
+Requires Python 3.6+ (stdlib only)
+Install: sudo cp wake /usr/local/bin/wake && sudo chmod +x /usr/local/bin/wake
+"""
+
+import curses
+import json
+import re
+import socket
+import sys
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+CONFIG_DIR    = Path.home() / ".config" / "wol_tui"
+CONFIG_FILE   = CONFIG_DIR / "devices.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "default_port":        9,
+    "default_broadcast":   "255.255.255.255",
+    "send_count":          3,
+    "send_delay_ms":       100,
+    "theme":               "red",
+    "log_max_lines":       200,
+    "show_ascii_logo":     True,
+    "confirm_before_wake": False,
+    "repeat_interval_sec": 0,
+    "show_mac_vendor":     True,
+    "startup_tab":         0,
+}
+
+OUI_MAP = {
+    "A4:C3:F0": "Intel",        "B8:27:EB": "Raspberry Pi",
+    "00:11:32": "Synology",     "00:50:56": "VMware",
+    "AC:DE:48": "Apple",        "00:1A:11": "Google",
+    "DC:A6:32": "Raspberry Pi", "00:E0:4C": "Realtek",
+    "18:31:BF": "Liteon",       "F4:6D:04": "Apple",
+    "74:D4:35": "Giga-byte",    "00:23:24": "Compal",
+}
+
+ASCII_LOGO = [
+    r" ██╗    ██╗ ██████╗ ██╗     ",
+    r" ██║    ██║██╔═══██╗██║     ",
+    r" ██║ █╗ ██║██║   ██║██║     ",
+    r" ██║███╗██║██║   ██║██║     ",
+    r" ╚███╔███╔╝╚██████╔╝███████╗",
+    r"  ╚══╝╚══╝  ╚═════╝ ╚══════╝",
+    r"",
+    r"  ──  Wake  On  LAN  v3.1  ──",
+]
+
+# ── Color pairs ────────────────────────────────────────────────────────────────
+CP_NORMAL   = 1
+CP_DIM      = 2
+CP_ACCENT   = 3
+CP_GREEN    = 4
+CP_RED      = 5
+CP_YELLOW   = 6
+CP_SELECTED = 7
+CP_HEADER   = 8
+CP_WHITE    = 9
+CP_LOGO1    = 10
+CP_LOGO2    = 11
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def validate_mac(mac):
+    return bool(re.fullmatch(r'([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}', mac.strip()))
+
+def validate_ip(ip):
+    parts = ip.strip().split(".")
+    if len(parts) != 4: return False
+    try:   return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError: return False
+
+def build_magic_packet(mac):
+    mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+    return b'\xff' * 6 + mac_bytes * 16
+
+def get_vendor(mac):
+    return OUI_MAP.get(mac.upper()[:8], "Unknown vendor")
+
+def safe_add(win, y, x, text, attr=0):
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w: return
+        text = text[:max(0, w - x - 1)]
+        if text: win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+def draw_box(win, y, x, h, w, color, title=""):
+    a = curses.color_pair(color)
+    try:
+        win.attron(a)
+        win.addch(y,     x,       curses.ACS_ULCORNER)
+        win.addch(y,     x+w-1,   curses.ACS_URCORNER)
+        win.addch(y+h-1, x,       curses.ACS_LLCORNER)
+        win.addch(y+h-1, x+w-1,   curses.ACS_LRCORNER)
+        win.hline(y,     x+1,     curses.ACS_HLINE, w-2)
+        win.hline(y+h-1, x+1,     curses.ACS_HLINE, w-2)
+        win.vline(y+1,   x,       curses.ACS_VLINE, h-2)
+        win.vline(y+1,   x+w-1,   curses.ACS_VLINE, h-2)
+        win.attroff(a)
+    except curses.error:
+        pass
+    if title:
+        safe_add(win, y, x+2, f" {title} ", curses.color_pair(CP_ACCENT) | curses.A_BOLD)
+
+# ── Persistence ────────────────────────────────────────────────────────────────
+def load_devices():
+    try:
+        if CONFIG_FILE.exists():
+            data = json.loads(CONFIG_FILE.read_text())
+            if isinstance(data, list): return data
+    except Exception:
+        pass
+    return []           # ← no presets, start empty
+
+def save_devices(devices):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(devices, indent=2))
+
+def load_settings():
+    s = DEFAULT_SETTINGS.copy()
+    try:
+        if SETTINGS_FILE.exists():
+            s.update(json.loads(SETTINGS_FILE.read_text()))
+    except Exception:
+        pass
+    return s
+
+def save_settings(settings):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+# ── WoL sender ─────────────────────────────────────────────────────────────────
+def send_wol(mac, broadcast, port, count=1, delay_ms=100):
+    packet = build_magic_packet(mac)
+    results = []
+    for i in range(count):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.settimeout(2)
+                s.sendto(packet, (broadcast, port))
+            results.append(True)
+        except Exception as e:
+            results.append(str(e))
+        if i < count - 1 and delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+    return results, len(packet)
+
+# ── Input dialog ────────────────────────────────────────────────────────────────
+def input_dialog(stdscr, title, fields):
+    curses.curs_set(1)
+    sh, sw = stdscr.getmaxyx()
+    dw = min(64, sw - 4)
+    dh = len(fields) * 3 + 6
+    dy = max(0, (sh - dh) // 2)
+    dx = max(0, (sw - dw) // 2)
+
+    panel = curses.newwin(dh, dw, dy, dx)
+    panel.keypad(True)
+
+    values  = {f["key"]: f.get("default", "") for f in fields}
+    cursors = {f["key"]: len(f.get("default", "")) for f in fields}
+    focused = 0
+    error   = ""
+
+    while True:
+        panel.erase()
+        draw_box(panel, 0, 0, dh, dw, CP_ACCENT, title)
+
+        for i, f in enumerate(fields):
+            ry = 2 + i * 3
+            is_f = (i == focused)
+            safe_add(panel, ry, 3, f["label"],
+                     curses.color_pair(CP_ACCENT if is_f else CP_DIM) | curses.A_BOLD)
+            fw  = dw - 6
+            val = values[f["key"]]
+            disp = val[max(0, len(val)-fw):] if len(val) > fw else val
+            fa  = (curses.color_pair(CP_WHITE) | curses.A_REVERSE) if is_f else curses.color_pair(CP_DIM)
+            safe_add(panel, ry+1, 3, " " * fw, fa)
+            safe_add(panel, ry+1, 3, disp, fa)
+
+        safe_add(panel, dh-2, 3, "[Tab/↑↓] Next field   [Enter] Confirm   [Esc] Cancel",
+                 curses.color_pair(CP_DIM))
+        if error:
+            safe_add(panel, dh-3, 3, f"! {error}"[:dw-6],
+                     curses.color_pair(CP_RED) | curses.A_BOLD)
+
+        cf  = fields[focused]
+        cfy = 2 + focused * 3 + 1
+        fw  = dw - 6
+        val = values[cf["key"]]
+        cx  = min(cursors[cf["key"]], len(val))
+        ds  = max(0, len(val) - fw)
+        try: panel.move(cfy, 3 + cx - ds)
+        except curses.error: pass
+
+        panel.refresh()
+        k = panel.getch()
+
+        if k == 27:
+            curses.curs_set(0); return None
+        elif k in (curses.KEY_ENTER, 10, 13):
+            error = ""
+            for f in fields:
+                v = values[f["key"]].strip()
+                if f.get("required") and not v:
+                    error = f"{f['label']} is required"; break
+                if f.get("validate") == "mac" and v and not validate_mac(v):
+                    error = "Invalid MAC  (format: AA:BB:CC:DD:EE:FF)"; break
+                if f.get("validate") == "ip" and v and not validate_ip(v):
+                    error = "Invalid IP address"; break
+                if f.get("validate") == "port" and v:
+                    try:
+                        if not (1 <= int(v) <= 65535): raise ValueError
+                    except ValueError:
+                        error = "Port must be 1–65535"; break
+            if not error:
+                curses.curs_set(0)
+                return {f["key"]: values[f["key"]].strip() for f in fields}
+        elif k in (9, curses.KEY_DOWN):
+            focused = (focused + 1) % len(fields)
+        elif k == curses.KEY_UP:
+            focused = (focused - 1) % len(fields)
+        elif k in (curses.KEY_BACKSPACE, 127, 8):
+            key = cf["key"]; c = cursors[key]
+            if c > 0:
+                values[key]  = values[key][:c-1] + values[key][c:]
+                cursors[key] = c - 1
+        elif k == curses.KEY_LEFT:
+            cursors[cf["key"]] = max(0, cursors[cf["key"]] - 1)
+        elif k == curses.KEY_RIGHT:
+            cursors[cf["key"]] = min(len(values[cf["key"]]), cursors[cf["key"]] + 1)
+        elif k == curses.KEY_HOME:
+            cursors[cf["key"]] = 0
+        elif k == curses.KEY_END:
+            cursors[cf["key"]] = len(values[cf["key"]])
+        elif k == curses.KEY_DC:
+            key = cf["key"]; c = cursors[key]
+            if c < len(values[key]):
+                values[key] = values[key][:c] + values[key][c+1:]
+        elif 32 <= k <= 126:
+            key = cf["key"]; c = cursors[key]
+            mx  = cf.get("maxlen", 64)
+            if len(values[key]) < mx:
+                ch = chr(k).upper() if cf.get("validate") == "mac" else chr(k)
+                values[key]  = values[key][:c] + ch + values[key][c:]
+                cursors[key] = c + 1
+
+# ── Confirm dialog ──────────────────────────────────────────────────────────────
+def confirm_dialog(stdscr, message, yes_label="Yes", no_label="No"):
+    sh, sw = stdscr.getmaxyx()
+    dw = min(54, sw - 4)
+    dh = 7
+    panel = curses.newwin(dh, dw, (sh-dh)//2, (sw-dw)//2)
+    panel.keypad(True)
+    sel = 0
+    while True:
+        panel.erase()
+        draw_box(panel, 0, 0, dh, dw, CP_RED, "Confirm")
+        safe_add(panel, 2, 3, message[:dw-6], curses.color_pair(CP_WHITE))
+        bw = 14
+        yx = dw//2 - bw - 1
+        nx = dw//2 + 1
+        ya = (curses.color_pair(CP_GREEN)|curses.A_REVERSE|curses.A_BOLD) if sel==0 else curses.color_pair(CP_DIM)
+        na = (curses.color_pair(CP_RED)  |curses.A_REVERSE|curses.A_BOLD) if sel==1 else curses.color_pair(CP_DIM)
+        safe_add(panel, dh-2, yx, f" {yes_label:^12} ", ya)
+        safe_add(panel, dh-2, nx, f" {no_label:^12} ",  na)
+        panel.refresh()
+        k = panel.getch()
+        if k in (curses.KEY_LEFT, curses.KEY_RIGHT, 9): sel ^= 1
+        elif k in (curses.KEY_ENTER, 10, 13):           return sel == 0
+        elif k == 27:                                    return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+class WoLApp:
+    TABS = ["  Devices  ", "  Wake  ", "  Log  ", "  Settings  ", "  Help  "]
+
+    def __init__(self, stdscr):
+        self.scr          = stdscr
+        self.devices      = load_devices()
+        self.settings     = load_settings()
+        self.log          = []
+        self.tab          = self.settings.get("startup_tab", 0)
+        self.dev_sel      = 0
+        self.dev_scroll   = 0
+        self.log_scroll   = 0
+        self.set_sel      = 0
+        self.status       = "Ready — press [a] to add your first device"
+        self.sending      = False
+        self.pkt_pos      = -1
+        self._sopts       = []
+        self._setup_colors()
+        curses.curs_set(0)
+        self.scr.timeout(80)
+        self._log("Wake-on-LAN ready.", "info")
+        self._log(f"Devices stored in: {CONFIG_FILE}", "dim")
+        if not self.devices:
+            self._log("No devices yet. Press [a] on the Devices tab to add one.", "warn")
+
+    def _setup_colors(self):
+        curses.start_color()
+        curses.use_default_colors()
+        theme = self.settings.get("theme", "red")
+        accent = (curses.COLOR_RED   if theme == "red"   else
+                  curses.COLOR_CYAN  if theme == "cyan"  else
+                  curses.COLOR_GREEN)
+        curses.init_pair(CP_NORMAL,   curses.COLOR_WHITE,  -1)
+        curses.init_pair(CP_DIM,      curses.COLOR_BLACK,  -1)
+        curses.init_pair(CP_ACCENT,   accent,              -1)
+        curses.init_pair(CP_GREEN,    curses.COLOR_GREEN,  -1)
+        curses.init_pair(CP_RED,      curses.COLOR_RED,    -1)
+        curses.init_pair(CP_YELLOW,   curses.COLOR_YELLOW, -1)
+        curses.init_pair(CP_SELECTED, curses.COLOR_BLACK,  accent)
+        curses.init_pair(CP_HEADER,   curses.COLOR_BLACK,  curses.COLOR_WHITE)
+        curses.init_pair(CP_WHITE,    curses.COLOR_WHITE,  -1)
+        curses.init_pair(CP_LOGO1,    curses.COLOR_RED,    -1)
+        curses.init_pair(CP_LOGO2,    curses.COLOR_WHITE,  -1)
+
+    def _log(self, msg, kind="info"):
+        self.log.append((ts(), msg, kind))
+        mx = self.settings.get("log_max_lines", 200)
+        if len(self.log) > mx:
+            self.log = self.log[-mx:]
+
+    def _next_id(self):
+        return max((d["id"] for d in self.devices), default=0) + 1
+
+    def _local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]; s.close(); return ip
+        except Exception:
+            return "0.0.0.0"
+
+    # ── Drawing ────────────────────────────────────────────────────────────────
+    def _draw_tabs(self, y):
+        x = 0
+        for i, label in enumerate(self.TABS):
+            a = (curses.color_pair(CP_SELECTED)|curses.A_BOLD) if i==self.tab else curses.color_pair(CP_DIM)
+            safe_add(self.scr, y, x, label, a)
+            x += len(label) + 1
+
+    def _draw_logo(self, y):
+        sh, sw = self.scr.getmaxyx()
+        lx = max(0, (sw - 30) // 2)
+        for i, line in enumerate(ASCII_LOGO):
+            if i < len(ASCII_LOGO) - 1:
+                color = CP_LOGO1 if i % 2 == 0 else CP_LOGO2
+                attr  = curses.color_pair(color) | curses.A_BOLD
+            else:
+                attr = curses.color_pair(CP_ACCENT) | curses.A_BOLD
+            safe_add(self.scr, y+i, lx, line, attr)
+
+    def _draw_statusbar(self, y, w):
+        bar = f" {ts()}  │  {self.status:<45}│ [q]Quit  [Tab]Tab  [1-5]Jump "
+        safe_add(self.scr, y, 0, bar[:w].ljust(w), curses.color_pair(CP_HEADER))
+
+    def _draw_anim(self, y, x, w):
+        tw = w - 2
+        safe_add(self.scr, y, x, "─" * tw, curses.color_pair(CP_DIM))
+        safe_add(self.scr, y, x,      "◉", curses.color_pair(CP_ACCENT)|curses.A_BOLD)
+        safe_add(self.scr, y, x+tw-1, "◉", curses.color_pair(CP_GREEN) |curses.A_BOLD)
+        if 0 <= self.pkt_pos < tw:
+            safe_add(self.scr, y, x + self.pkt_pos, "▶",
+                     curses.color_pair(CP_ACCENT)|curses.A_BOLD)
+
+    # ── Tab: Devices ───────────────────────────────────────────────────────────
+    def draw_devices(self, y, x, h, w):
+        draw_box(self.scr, y, x, h, w, CP_ACCENT, "DEVICES")
+        iw = w - 4
+
+        # Header
+        hdr = f"  {'#':<3} {'Name':<22} {'MAC Address':<19} {'Broadcast':<17} {'Port':<5}  Note"
+        safe_add(self.scr, y+1, x+1, hdr[:iw],
+                 curses.color_pair(CP_ACCENT)|curses.A_BOLD|curses.A_UNDERLINE)
+
+        visible = h - 4
+        if self.dev_sel < self.dev_scroll:
+            self.dev_scroll = self.dev_sel
+        if self.dev_sel >= self.dev_scroll + visible:
+            self.dev_scroll = self.dev_sel - visible + 1
+
+        if not self.devices:
+            empty1 = "No devices saved yet."
+            empty2 = "Press [a] to add your first device."
+            safe_add(self.scr, y + h//2 - 1, x + (w - len(empty1))//2,
+                     empty1, curses.color_pair(CP_DIM)|curses.A_BOLD)
+            safe_add(self.scr, y + h//2,     x + (w - len(empty2))//2,
+                     empty2, curses.color_pair(CP_ACCENT))
+        else:
+            for i, d in enumerate(self.devices[self.dev_scroll : self.dev_scroll+visible]):
+                ri  = i + self.dev_scroll
+                ry  = y + 2 + i
+                sel = ri == self.dev_sel
+                vendor = f" [{get_vendor(d['mac'])}]" if self.settings.get("show_mac_vendor") else ""
+                line = (f"  {d['id']:<3} {d['name']:<22} {d['mac']:<19}"
+                        f" {d['ip']:<17} {str(d.get('port',9)):<5}  {d.get('note','')}")
+                if sel:
+                    safe_add(self.scr, ry, x+1, " "*(iw+2),
+                             curses.color_pair(CP_SELECTED))
+                    safe_add(self.scr, ry, x+1, line[:iw+2],
+                             curses.color_pair(CP_SELECTED)|curses.A_BOLD)
+                else:
+                    safe_add(self.scr, ry, x+1, line[:iw+2],
+                             curses.color_pair(CP_NORMAL))
+
+            # Scrollbar
+            total = len(self.devices)
+            if total > visible:
+                pct = int(self.dev_scroll / max(1, total-visible) * (visible-1))
+                for i in range(visible):
+                    safe_add(self.scr, y+2+i, x+w-2,
+                             "█" if i==pct else "░", curses.color_pair(CP_DIM))
+
+        safe_add(self.scr, y+h-1, x+2,
+                 " [a]Add  [e]Edit  [d]Delete  [↑↓]Select  [Enter/w]Wake  [Tab]Next tab "[:w-4],
+                 curses.color_pair(CP_ACCENT))
+
+    # ── Tab: Wake ──────────────────────────────────────────────────────────────
+    def draw_wake(self, y, x, h, w):
+        draw_box(self.scr, y, x, h, w, CP_ACCENT, "WAKE DEVICE")
+        iw = w - 4
+        cy = y + 2
+
+        if not self.devices:
+            msg = "No devices. Go to Devices tab [1] and add one first."
+            safe_add(self.scr, cy+2, x + (w-len(msg))//2, msg,
+                     curses.color_pair(CP_YELLOW)|curses.A_BOLD)
+            return
+
+        d = self.devices[min(self.dev_sel, len(self.devices)-1)]
+
+        draw_box(self.scr, cy, x+2, 7, iw, CP_DIM)
+        safe_add(self.scr, cy,   x+4, " TARGET ", curses.color_pair(CP_ACCENT)|curses.A_BOLD)
+        safe_add(self.scr, cy+1, x+4, f"Name   : {d['name']}",
+                 curses.color_pair(CP_WHITE)|curses.A_BOLD)
+        safe_add(self.scr, cy+2, x+4, f"MAC    : {d['mac']}",
+                 curses.color_pair(CP_ACCENT))
+        safe_add(self.scr, cy+3, x+4, f"Bcast  : {d['ip']}  Port: {d.get('port',9)}",
+                 curses.color_pair(CP_NORMAL))
+        safe_add(self.scr, cy+4, x+4, f"Vendor : {get_vendor(d['mac'])}",
+                 curses.color_pair(CP_DIM))
+        safe_add(self.scr, cy+5, x+4, f"Note   : {d.get('note','')}",
+                 curses.color_pair(CP_DIM))
+        cy += 8
+
+        pkt = (f"Magic packet · {self.settings.get('send_count',3)}× sends · "
+               f"{self.settings.get('send_delay_ms',100)}ms gap · 102 bytes each")
+        safe_add(self.scr, cy, x+2, pkt[:iw], curses.color_pair(CP_DIM))
+        cy += 2
+
+        if cy + 4 < y + h - 2:
+            src_lbl = f"SRC: {self._local_ip()}"
+            dst_lbl = f"DST: {d['ip']}"
+            safe_add(self.scr, cy,   x+2, src_lbl, curses.color_pair(CP_DIM))
+            safe_add(self.scr, cy,   x+w-2-len(dst_lbl), dst_lbl, curses.color_pair(CP_DIM))
+            self._draw_anim(cy+1, x+2, iw)
+            cy += 3
+
+        sc = CP_GREEN if "uccess" in self.status else (CP_RED if "rror" in self.status else CP_YELLOW)
+        safe_add(self.scr, cy, x+2, f"Status: {self.status}"[:iw],
+                 curses.color_pair(sc)|curses.A_BOLD)
+        cy += 2
+
+        wa = (curses.color_pair(CP_ACCENT)|curses.A_BOLD|curses.A_REVERSE) if not self.sending \
+             else curses.color_pair(CP_DIM)
+        safe_add(self.scr, cy, x+2, " [w/Enter] SEND MAGIC PACKET ", wa)
+        safe_add(self.scr, cy, x+34,
+                 f" [←] Prev device   [→] Next device  ({self.dev_sel+1}/{len(self.devices)}) ",
+                 curses.color_pair(CP_DIM))
+
+    # ── Tab: Log ───────────────────────────────────────────────────────────────
+    def draw_log(self, y, x, h, w):
+        draw_box(self.scr, y, x, h, w, CP_ACCENT, "ACTIVITY LOG")
+        iw = w - 4
+        visible = h - 3
+        total   = len(self.log)
+        if self.log_scroll < 0 or self.log_scroll >= total - visible:
+            self.log_scroll = max(0, total - visible)
+
+        for i, (ts_s, msg, kind) in enumerate(self.log[self.log_scroll:self.log_scroll+visible]):
+            color = {"info":CP_ACCENT,"success":CP_GREEN,"error":CP_RED,
+                     "warn":CP_YELLOW,"dim":CP_DIM}.get(kind, CP_NORMAL)
+            icon  = {"info":"ℹ","success":"✓","error":"✗","warn":"⚠","dim":"·"}.get(kind,"·")
+            safe_add(self.scr, y+1+i, x+2, f" {icon} {ts_s}  {msg}"[:iw],
+                     curses.color_pair(color))
+
+        safe_add(self.scr, y+h-1, x+2,
+                 f" {total} entries  [↑↓/PgUp/PgDn] Scroll  [c] Clear  [s] Save "[:w-4],
+                 curses.color_pair(CP_ACCENT))
+
+    # ── Tab: Settings ──────────────────────────────────────────────────────────
+    def draw_settings(self, y, x, h, w):
+        draw_box(self.scr, y, x, h, w, CP_ACCENT, "SETTINGS")
+        iw = w - 4
+        options = [
+            ("Default Port",        "default_port",        "int",   "UDP port for WoL packets (usually 9 or 7)"),
+            ("Default Broadcast",   "default_broadcast",   "str",   "Broadcast IP, e.g. 192.168.1.255"),
+            ("Send Count",          "send_count",          "int",   "Packets sent per wake command (1-10)"),
+            ("Send Delay (ms)",     "send_delay_ms",       "int",   "Delay between repeated packets in ms"),
+            ("Theme",               "theme",               "cycle", "Accent color: red / cyan / green"),
+            ("Log Max Lines",       "log_max_lines",       "int",   "Maximum log history to keep"),
+            ("Show ASCII Logo",     "show_ascii_logo",     "bool",  "Toggle the big ASCII logo"),
+            ("Confirm Before Wake", "confirm_before_wake", "bool",  "Ask for confirmation before sending"),
+            ("Show MAC Vendor",     "show_mac_vendor",     "bool",  "OUI vendor lookup in device list"),
+            ("Startup Tab",         "startup_tab",         "int",   "Tab shown on launch (0=Devices)"),
+            ("Repeat Interval (s)", "repeat_interval_sec", "int",   "Auto-resend every N seconds (0=off)"),
+        ]
+        self._sopts = options
+        visible = h - 4
+        self.set_sel = max(0, min(self.set_sel, len(options)-1))
+        scroll  = max(0, self.set_sel - visible + 2)
+
+        safe_add(self.scr, y+1, x+2, f"  {'Setting':<28} {'Value':<16} Description"[:iw],
+                 curses.color_pair(CP_ACCENT)|curses.A_BOLD|curses.A_UNDERLINE)
+
+        for i, (label, key, kind, desc) in enumerate(options[scroll:scroll+visible]):
+            ri  = i + scroll
+            ry  = y + 2 + i
+            val = str(self.settings.get(key, DEFAULT_SETTINGS.get(key, "")))
+            sel = ri == self.set_sel
+            row = f"  {label:<28} {val:<16} {desc}"
+            a   = (curses.color_pair(CP_SELECTED)|curses.A_BOLD) if sel else curses.color_pair(CP_NORMAL)
+            safe_add(self.scr, ry, x+2, " "*(iw) if sel else "", curses.color_pair(CP_SELECTED))
+            safe_add(self.scr, ry, x+2, row[:iw], a)
+
+        safe_add(self.scr, y+h-1, x+2,
+                 " [↑↓] Select  [Enter/Space] Edit  [r] Reset all defaults "[:w-4],
+                 curses.color_pair(CP_ACCENT))
+
+    # ── Tab: Help ──────────────────────────────────────────────────────────────
+    def draw_help(self, y, x, h, w):
+        draw_box(self.scr, y, x, h, w, CP_ACCENT, "HELP & KEYBINDINGS")
+        rows = [
+            ("NAVIGATION",    "Tab / Shift+Tab",   "Switch tabs"),
+            ("",              "1 – 5",             "Jump to tab directly"),
+            ("",              "↑ / ↓",             "Navigate list"),
+            ("",              "PgUp / PgDn",       "Fast scroll"),
+            ("",              "q",                 "Quit"),
+            ("DEVICES TAB",   "a",                 "Add a new device"),
+            ("",              "e",                 "Edit selected device"),
+            ("",              "d",                 "Delete selected device"),
+            ("",              "Enter / w",         "Wake selected device"),
+            ("WAKE TAB",      "w / Enter",         "Send magic packet"),
+            ("",              "← / →",             "Switch target device"),
+            ("LOG TAB",       "c",                 "Clear log"),
+            ("",              "s",                 "Save log to ~/wol_log_*.txt"),
+            ("SETTINGS TAB",  "Enter / Space",     "Edit highlighted setting"),
+            ("",              "r",                 "Reset all to defaults"),
+            ("WOL FACTS",     "Magic packet",      "6×0xFF + MAC×16 = 102 bytes"),
+            ("",              "Transport",         "UDP broadcast port 9 (or 7)"),
+            ("",              "BIOS required",     "Enable WoL in BIOS/UEFI + NIC"),
+            ("",              "Command name",      "Script is called  wake"),
+        ]
+        cy = y + 2
+        for section, key, val in rows:
+            if cy >= y + h - 1: break
+            if section:
+                safe_add(self.scr, cy, x+2, f" {section} ",
+                         curses.color_pair(CP_ACCENT)|curses.A_BOLD)
+                safe_add(self.scr, cy, x+20,
+                         f"{key:<20} {val}",
+                         curses.color_pair(CP_WHITE))
+            else:
+                safe_add(self.scr, cy, x+20,
+                         f"{key:<20} {val}",
+                         curses.color_pair(CP_NORMAL))
+            cy += 1
+
+    # ── Master draw ────────────────────────────────────────────────────────────
+    def draw(self):
+        self.scr.erase()
+        sh, sw = self.scr.getmaxyx()
+        if sh < 20 or sw < 60:
+            safe_add(self.scr, 0, 0,
+                     "Terminal too small — need at least 60×20",
+                     curses.color_pair(CP_RED)|curses.A_BOLD)
+            self.scr.refresh(); return
+
+        logo_h = len(ASCII_LOGO)+1 if self.settings.get("show_ascii_logo") else 0
+        if logo_h: self._draw_logo(0)
+
+        tab_y = logo_h
+        self._draw_tabs(tab_y)
+        cy = tab_y + 1
+        ch = sh - cy - 1
+
+        if ch < 5: return
+        draw = [self.draw_devices, self.draw_wake, self.draw_log,
+                self.draw_settings, self.draw_help]
+        draw[self.tab](cy, 0, ch, sw)
+        self._draw_statusbar(sh-1, sw)
+        self.scr.refresh()
+
+    # ── Actions ────────────────────────────────────────────────────────────────
+    def do_wake(self, device=None):
+        if device is None:
+            if not self.devices: return
+            device = self.devices[min(self.dev_sel, len(self.devices)-1)]
+        d = device
+        if self.settings.get("confirm_before_wake"):
+            if not confirm_dialog(self.scr, f"Wake '{d['name']}' ({d['mac']})?"):
+                self._log(f"Wake cancelled for {d['name']}", "warn"); return
+        count    = int(self.settings.get("send_count", 3))
+        delay_ms = int(self.settings.get("send_delay_ms", 100))
+        port     = int(d.get("port", self.settings.get("default_port", 9)))
+        bcast    = d.get("ip", self.settings.get("default_broadcast","255.255.255.255"))
+        self.sending = True
+        self.status  = f"Sending to {d['name']}…"
+        self._log(f"Wake → {d['name']}  MAC:{d['mac']}  {bcast}:{port}  ×{count}", "info")
+
+        def _anim():
+            for p in range(32):
+                self.pkt_pos = p; time.sleep(0.035)
+            self.pkt_pos = -1
+        threading.Thread(target=_anim, daemon=True).start()
+
+        def _send():
+            results, pkt_len = send_wol(d["mac"], bcast, port, count, delay_ms)
+            ok   = sum(1 for r in results if r is True)
+            fail = [r for r in results if r is not True]
+            if ok == count:
+                self.status = f"✓ Sent {count}× {pkt_len}B → {d['name']}"
+                self._log(f"Success — {count} packet(s) delivered ({pkt_len} bytes each)", "success")
+            else:
+                self.status = f"⚠ Partial: {ok}/{count} sent to {d['name']}"
+                self._log(f"Partial send {ok}/{count}. Error: {fail[0] if fail else '?'}", "warn")
+            rep = int(self.settings.get("repeat_interval_sec", 0))
+            if rep > 0:
+                self._log(f"Auto-repeat in {rep}s…", "dim")
+                time.sleep(rep); self.do_wake(d)
+            self.sending = False
+        threading.Thread(target=_send, daemon=True).start()
+
+    def do_add_device(self):
+        result = input_dialog(self.scr, "ADD DEVICE", [
+            {"key":"name","label":"Device Name",   "required":True, "maxlen":30},
+            {"key":"mac", "label":"MAC Address",   "required":True, "validate":"mac",  "maxlen":17},
+            {"key":"ip",  "label":"Broadcast IP",  "default":self.settings.get("default_broadcast","255.255.255.255"),
+                                                   "validate":"ip",  "maxlen":15},
+            {"key":"port","label":"UDP Port",      "default":str(self.settings.get("default_port",9)),
+                                                   "validate":"port","maxlen":5},
+            {"key":"note","label":"Note (optional)","maxlen":40},
+        ])
+        if result:
+            d = {"id":self._next_id(), "name":result["name"],
+                 "mac":result["mac"].upper(), "ip":result["ip"],
+                 "port":int(result["port"] or 9), "note":result["note"]}
+            self.devices.append(d)
+            save_devices(self.devices)
+            self.dev_sel = len(self.devices)-1
+            self._log(f"Added: {d['name']}  {d['mac']}  →  {d['ip']}:{d['port']}", "success")
+            self.status = f"Device '{d['name']}' saved"
+
+    def do_edit_device(self):
+        if not self.devices: return
+        d = self.devices[self.dev_sel]
+        result = input_dialog(self.scr, "EDIT DEVICE", [
+            {"key":"name","label":"Device Name", "default":d["name"],          "required":True,"maxlen":30},
+            {"key":"mac", "label":"MAC Address", "default":d["mac"],           "required":True,"validate":"mac","maxlen":17},
+            {"key":"ip",  "label":"Broadcast IP","default":d["ip"],            "validate":"ip","maxlen":15},
+            {"key":"port","label":"UDP Port",    "default":str(d.get("port",9)),"validate":"port","maxlen":5},
+            {"key":"note","label":"Note",        "default":d.get("note",""),   "maxlen":40},
+        ])
+        if result:
+            d.update({"name":result["name"],"mac":result["mac"].upper(),
+                      "ip":result["ip"],"port":int(result["port"] or 9),"note":result["note"]})
+            save_devices(self.devices)
+            self._log(f"Updated: {d['name']}", "info")
+            self.status = f"Device '{d['name']}' updated"
+
+    def do_delete_device(self):
+        if not self.devices: return
+        d = self.devices[self.dev_sel]
+        if confirm_dialog(self.scr, f"Delete '{d['name']}'?", "Delete", "Cancel"):
+            self.devices.pop(self.dev_sel)
+            self.dev_sel = max(0, self.dev_sel-1)
+            save_devices(self.devices)
+            self._log(f"Deleted: {d['name']}", "warn")
+            self.status = f"Deleted '{d['name']}'"
+
+    def do_clear_log(self):
+        self.log = []
+        self._log("Log cleared.", "dim")
+
+    def do_save_log(self):
+        path = Path.home() / f"wol_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            with open(path, "w") as f:
+                for ts_s, msg, kind in self.log:
+                    f.write(f"[{ts_s}] [{kind.upper():7}] {msg}\n")
+            self._log(f"Log saved → {path}", "success")
+            self.status = f"Log saved: {path.name}"
+        except Exception as e:
+            self._log(f"Save failed: {e}", "error")
+
+    def do_edit_setting(self):
+        opts = self._sopts
+        if not opts or self.set_sel >= len(opts): return
+        label, key, kind, _ = opts[self.set_sel]
+        current = str(self.settings.get(key, DEFAULT_SETTINGS.get(key,"")))
+        if kind == "bool":
+            self.settings[key] = not self.settings.get(key, False)
+            save_settings(self.settings)
+            self._log(f"Setting '{label}' → {self.settings[key]}", "info")
+        elif kind == "cycle":
+            cycles = {"theme":["red","cyan","green"]}
+            vals   = cycles.get(key, [current])
+            idx    = vals.index(current) if current in vals else 0
+            self.settings[key] = vals[(idx+1) % len(vals)]
+            save_settings(self.settings)
+            self._setup_colors()
+            self._log(f"Theme → {self.settings[key]}", "info")
+        else:
+            result = input_dialog(self.scr, f"EDIT: {label}",
+                                  [{"key":"val","label":label,"default":current,"maxlen":40}])
+            if result:
+                v = result["val"].strip()
+                if kind == "int":
+                    try:   v = int(v)
+                    except ValueError:
+                        self._log(f"Expected integer for '{label}'", "error"); return
+                self.settings[key] = v
+                save_settings(self.settings)
+                self._log(f"Setting '{label}' → {v}", "info")
+                if key == "theme": self._setup_colors()
+
+    def do_reset_settings(self):
+        if confirm_dialog(self.scr, "Reset ALL settings to defaults?", "Reset", "Cancel"):
+            self.settings = DEFAULT_SETTINGS.copy()
+            save_settings(self.settings)
+            self._setup_colors()
+            self._log("Settings reset to defaults.", "warn")
+            self.status = "Settings reset"
+
+    # ── Main loop ──────────────────────────────────────────────────────────────
+    def run(self):
+        while True:
+            self.draw()
+            k = self.scr.getch()
+            if k == -1: continue
+
+            if k in (ord('q'), ord('Q')):
+                if confirm_dialog(self.scr, "Quit Wake-on-LAN?", "Quit", "Stay"):
+                    break
+
+            elif k == 9:
+                self.tab = (self.tab + 1) % len(self.TABS)
+            elif k == curses.KEY_BTAB:
+                self.tab = (self.tab - 1) % len(self.TABS)
+            elif k in (ord('1'),ord('2'),ord('3'),ord('4'),ord('5')):
+                self.tab = int(chr(k)) - 1
+
+            elif self.tab == 0:   # ── Devices
+                if   k == curses.KEY_UP:    self.dev_sel = max(0, self.dev_sel-1)
+                elif k == curses.KEY_DOWN:  self.dev_sel = min(len(self.devices)-1, self.dev_sel+1)
+                elif k == curses.KEY_PPAGE: self.dev_sel = max(0, self.dev_sel-5)
+                elif k == curses.KEY_NPAGE: self.dev_sel = min(len(self.devices)-1, self.dev_sel+5)
+                elif k in (ord('a'),ord('A')): self.do_add_device()
+                elif k in (ord('e'),ord('E')): self.do_edit_device()
+                elif k in (ord('d'),ord('D')): self.do_delete_device()
+                elif k in (curses.KEY_ENTER,10,13,ord('w'),ord('W')):
+                    if self.devices:
+                        self.do_wake(); self.tab = 1
+
+            elif self.tab == 1:   # ── Wake
+                if   k in (curses.KEY_ENTER,10,13,ord('w'),ord('W')):
+                    if not self.sending: self.do_wake()
+                elif k == curses.KEY_LEFT:
+                    self.dev_sel = max(0, self.dev_sel-1)
+                elif k == curses.KEY_RIGHT:
+                    self.dev_sel = min(len(self.devices)-1, self.dev_sel+1)
+
+            elif self.tab == 2:   # ── Log
+                if   k == curses.KEY_UP:    self.log_scroll = max(0, self.log_scroll-1)
+                elif k == curses.KEY_DOWN:  self.log_scroll = min(max(0,len(self.log)-1), self.log_scroll+1)
+                elif k == curses.KEY_PPAGE: self.log_scroll = max(0, self.log_scroll-10)
+                elif k == curses.KEY_NPAGE: self.log_scroll = min(max(0,len(self.log)-1), self.log_scroll+10)
+                elif k in (ord('c'),ord('C')): self.do_clear_log()
+                elif k in (ord('s'),ord('S')): self.do_save_log()
+
+            elif self.tab == 3:   # ── Settings
+                if   k == curses.KEY_UP:    self.set_sel = max(0, self.set_sel-1)
+                elif k == curses.KEY_DOWN:  self.set_sel = self.set_sel + 1
+                elif k in (curses.KEY_ENTER,10,13,ord(' ')): self.do_edit_setting()
+                elif k in (ord('r'),ord('R')): self.do_reset_settings()
+
+
+# ── Entry ───────────────────────────────────────────────────────────────────────
+def main(stdscr):
+    WoLApp(stdscr).run()
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
+    print("\nwake — closed. Goodbye!")
