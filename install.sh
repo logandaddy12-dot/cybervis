@@ -1,32 +1,30 @@
 #!/bin/bash
 
-# 1. Define the exact source
-# Verify this URL is correct for your 'cybervis.c'
-SOURCE="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
+# 1. THE URL - DOUBLE CHECK THIS! 
+# If your branch is 'master', change 'main' to 'master' below.
+URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main/cybervis.c"
 
-echo "--- INSTALLING CYBERVIS ---"
+echo "--- INSTALLING ---"
 
-# 2. Download directly to the compiler
-# This pipes the web code straight into gcc
-echo "Step 1: Downloading and Compiling..."
-curl -sL "$SOURCE" | gcc -x c -O3 - -o cybervis -lm -lpthread
+# 2. Download to a guaranteed location
+curl -sL "$URL" -o /tmp/cybervis.c
 
-# 3. Check if the binary was actually created
-if [ ! -f "cybervis" ]; then
-    echo "ERROR: Compilation failed! Is gcc installed?"
-    echo "Try: sudo apt update && sudo apt install build-essential -y"
+# 3. Validation: If the file is empty or missing, stop now.
+if [ ! -s /tmp/cybervis.c ]; then
+    echo "ERROR: The file at $URL is empty or 404."
+    echo "Please check if your branch name is 'main' or 'master'."
     exit 1
 fi
 
-# 4. Move it to the system path so you can run 'cybervis'
-echo "Step 2: Moving to /usr/local/bin..."
-sudo mv cybervis /usr/local/bin/cybervis
-sudo chmod +x /usr/local/bin/cybervis
+# 4. Compile using the absolute path
+gcc /tmp/cybervis.c -O3 -o /tmp/cybervis -lm -lpthread
 
-# 5. Final Confirmation
-if [ -f "/usr/local/bin/cybervis" ]; then
-    echo "--- SUCCESS ---"
-    echo "You can now run the app by typing: cybervis"
+# 5. Move it
+if [ -f "/tmp/cybervis" ]; then
+    sudo mv /tmp/cybervis /usr/local/bin/cybervis
+    sudo chmod +x /usr/local/bin/cybervis
+    echo "--- SUCCESS! Run 'cybervis' ---"
 else
-    echo "ERROR: Move failed. Try running the curl command with sudo."
+    echo "ERROR: gcc failed to build the binary."
+    exit 1
 fi
