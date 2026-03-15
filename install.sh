@@ -13,6 +13,9 @@ NC='\033[0m' # No Color
 PREFIX="/usr/local/bin"
 REPO_URL="https://raw.githubusercontent.com/logandaddy12-dot/cybervis/main"
 
+# Uses $HOME so it dynamically adapts to any user (e.g., /home/rxvy/cybervis_build)
+BUILD_DIR="$HOME/cybervis_build"
+
 echo -e "${CYAN}${BOLD}CYBERVIS v5.0 Installer${NC}"
 echo -e "=========================\n"
 
@@ -27,10 +30,10 @@ if ! command -v curl &> /dev/null; then
     exit 1
 fi
 
-# 2. Setup Temporary Directory
-echo -e "${CYAN}[*] Setting up build environment...${NC}"
-TMP_DIR=$(mktemp -d)
-cd "$TMP_DIR"
+# 2. Setup Build Directory
+echo -e "${CYAN}[*] Setting up build directory at ${BUILD_DIR}...${NC}"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
 
 # 3. Download Source
 echo -e "${CYAN}[*] Downloading source from GitHub...${NC}"
@@ -65,10 +68,8 @@ else
     echo -e "${GREEN}[+] Installed successfully.${NC}"
 fi
 
-# 6. Cleanup
-echo -e "${CYAN}[*] Cleaning up temporary files...${NC}"
-cd - > /dev/null
-rm -rf "$TMP_DIR"
+# 6. Finish (Notice we aren't deleting the build folder this time!)
+echo -e "${CYAN}[*] Build files retained in ${BUILD_DIR}.${NC}"
 
 echo -e "\n${GREEN}${BOLD}[✔] CYBERVIS is ready!${NC}"
 echo -e "Run it anywhere by typing: ${CYAN}cybervis${NC}"
